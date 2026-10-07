@@ -1,35 +1,35 @@
-const brevo = require('@getbrevo/brevo');
+const { BrevoClient } = require('@getbrevo/brevo');
 require('dotenv').config();
 
 const sendEmail = async (to, subject, text, replyTo = null, senderName = "TrustHire AI", html = null) => {
     try {
-        // Modern Brevo Initialization (v2.x+)
-        const apiInstance = new brevo.TransactionalEmailsApi();
-        
-        // Setup API Key securely
-        const apiKey = apiInstance.authentications['apiKey'];
-        apiKey.apiKey = process.env.BREVO_API_KEY;
+        const brevo = new BrevoClient({ 
+            apiKey: process.env.BREVO_API_KEY 
+        });
 
-        const sendSmtpEmail = new brevo.SendSmtpEmail();
-        sendSmtpEmail.subject = subject;
-        
+        const payload = {
+            subject: subject,
+            sender: { name: senderName, email: process.env.EMAIL_USER },
+            to: [{ email: to }]
+        };
+
         if (html) {
-            sendSmtpEmail.htmlContent = html;
-        }
-        if (text && !html) {
-            sendSmtpEmail.textContent = text;
+            payload.htmlContent = html;
+        } else if (text) {
+            payload.textContent = text;
         }
 
-        sendSmtpEmail.sender = { name: senderName, email: process.env.EMAIL_USER };
-        sendSmtpEmail.to = [{ email: to }];
-        sendSmtpEmail.replyTo = { email: replyTo || process.env.EMAIL_USER };
+        if (replyTo) {
+            payload.replyTo = { email: replyTo };
+        } else {
+            payload.replyTo = { email: process.env.EMAIL_USER };
+        }
 
-        await apiInstance.sendTransacEmail(sendSmtpEmail);
+        await brevo.transactionalEmails.sendTransacEmail(payload);
         console.log(`Automated email successfully sent to: ${to} via Brevo API`);
     } catch (error) {
         console.error("Email failed to send via Brevo:");
-        // Prints the exact error from Brevo if something goes wrong
-        console.error(error.response ? error.response.text : error.message);
+        console.error(error.rawResponse ? error.rawResponse : error.message);
     }
 };
 
