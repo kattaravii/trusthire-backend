@@ -1,46 +1,68 @@
 const express = require('express');
 const multer = require('multer');
 const path = require('path');
-const fs = require('fs');
 const pdf = require('pdf-parse'); 
 const pool = require('../config/db');
 const auth = require('../middleware/authMiddleware');
 const sendEmail = require('../utils/sendEmail'); 
 const { Groq } = require('groq-sdk');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
+const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 
 const router = express.Router();
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-const uploadDir = path.join(__dirname, '../uploads');
-if (!fs.existsSync(uploadDir)) {
-    fs.mkdirSync(uploadDir, { recursive: true });
-}
-
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, uploadDir),
-    filename: (req, file, cb) => cb(null, Date.now() + path.extname(file.originalname))
+// 1. Initialize S3 Client for Neon Object Storage
+const s3 = new S3Client({
+    region: process.env.AWS_REGION || 'us-east-2',
+    endpoint: process.env.AWS_ENDPOINT_URL_S3,
+    credentials: {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+    },
+    forcePathStyle: true, // Required for S3-compatible endpoints like Neon
 });
-const upload = multer({ storage: storage });
+
+// 2. Use memory storage so the file is held in RAM and uploaded directly to Neon
+const upload = multer({ 
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit
+});
 
 router.post('/upload-resume', auth, upload.single('resume'), async (req, res) => {
     try {
         const studentId = req.user.id; 
         if (!req.file) return res.status(400).json({ error: 'Please upload a file' });
 
-        const resumeUrl = `http://localhost:5000/uploads/${req.file.filename}`;
+        // Parse PDF text directly from buffer in memory
         let resumeText = '';
-
         try {
-            const dataBuffer = fs.readFileSync(req.file.path);
-            const data = await pdf(dataBuffer);
+            const data = await pdf(req.file.buffer);
             resumeText = data.text || '';
         } catch (parseErr) {
             return res.status(400).json({ error: 'Could not read PDF text. Please ensure it is a text-based PDF.' });
         }
 
+        // Clean filename and upload to Neon S3 Storage
+        const fileExt = path.extname(req.file.originalname) || '.pdf';
+        const fileName = `${Date.now()}-${req.file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
+
+        const uploadCommand = new PutObjectCommand({
+            Bucket: 'resumes',
+            Key: fileName,
+            Body: req.file.buffer,
+            ContentType: req.file.mimetype || 'application/pdf',
+        });
+
+        await s3.send(uploadCommand);
+
+        // Construct the permanent public Neon URL
+        const s3Endpoint = (process.env.AWS_ENDPOINT_URL_S3 || '').replace(/\/$/, '');
+        const resumeUrl = `${s3Endpoint}/resumes/${fileName}`;
+
+        // AI Resume Analysis with Groq / Gemini Fallback
         let aiData;
         const prompt = `
             You are an elite technical recruiter. Analyze the following resume text.
@@ -73,7 +95,13 @@ router.post('/upload-resume', auth, upload.single('resume'), async (req, res) =>
                 const result = await model.generateContent(prompt);
                 aiData = JSON.parse(result.response.text().trim());
             } catch (geminiErr) {
-                aiData = { ats_score: 50, trust_score: 50, current_skills: ['JavaScript', 'React', 'Node.js'], missing_skills: ['Docker', 'CI/CD'], recommended_projects: ['Build a real-time collaborative workspace.'] };
+                aiData = { 
+                    ats_score: 50, 
+                    trust_score: 50, 
+                    current_skills: ['JavaScript', 'React', 'Node.js'], 
+                    missing_skills: ['Docker', 'CI/CD'], 
+                    recommended_projects: ['Build a real-time collaborative workspace.'] 
+                };
             }
         }
 
@@ -81,16 +109,23 @@ router.post('/upload-resume', auth, upload.single('resume'), async (req, res) =>
         const missingSkillsString = aiData.missing_skills ? aiData.missing_skills.join(', ') : 'N/A';
         const projectsString = aiData.recommended_projects ? aiData.recommended_projects.join(' | ') : 'N/A';
 
+        // Update database with permanent Neon S3 resume_url
         await pool.query(
             `INSERT INTO Students (student_id, full_name, resume_url, ats_score, trust_score, skills, missing_skills, recommended_projects) 
-             VALUES ($1, 'Student', $2, $3, $4, $5, $6, $7)
+             VALUES ($1, 'Student', $2, $3, $4, $5, $6, $7) 
              ON CONFLICT (student_id) 
              DO UPDATE SET resume_url = $2, ats_score = $3, trust_score = $4, skills = $5, missing_skills = $6, recommended_projects = $7`,
             [studentId, resumeUrl, aiData.ats_score || 0, aiData.trust_score || 0, currentSkillsString, missingSkillsString, projectsString]
         );
 
-        res.json({ message: 'Resume analyzed successfully!', resume_url: resumeUrl, ats_score: aiData.ats_score, trust_score: aiData.trust_score });
+        res.json({ 
+            message: 'Resume analyzed successfully!', 
+            resume_url: resumeUrl, 
+            ats_score: aiData.ats_score, 
+            trust_score: aiData.trust_score 
+        });
     } catch (err) {
+        console.error('Error during resume upload:', err);
         res.status(500).json({ error: 'Server error during resume processing: ' + err.message });
     }
 });
@@ -178,7 +213,7 @@ router.post('/apply', auth, async (req, res) => {
         const studentMessage = `Hello ${full_name},\n\nYou have successfully submitted your application for the ${appliedRole} position via TrustHire AI.\n\nYour current resume metrics:\n- ATS Score: ${ats_score}%\n- Trust Score: ${trust_score}%\n\nCompanies will review your profile shortly.\n\nBest of luck,\nThe TrustHire AI Team`;
         sendEmail(email, studentSubject, studentMessage).catch(err => console.warn("Student email failed", err));
 
-        // 2. Send detailed email to Company (if job has an associated email)
+        // 2. Send detailed email to Company
         if (companyEmail) {
             const companySubject = `New Job Application - ${appliedRole}`;
             const companyMessage = `Hello,\n\nA new candidate (${full_name}) has applied for the ${appliedRole} position.\n\nCandidate Metrics:\n- ATS Score: ${ats_score}%\n- Trust Score: ${trust_score}%\n- Top Skills: ${skills || 'N/A'}\n\nPlease log in to your TrustHire AI Company Portal to review their full resume and approve the application.\n\nBest,\nThe TrustHire AI Team`;
@@ -206,7 +241,7 @@ router.post('/send-dsa-sheet', auth, async (req, res) => {
     } catch (err) { res.status(500).json({ error: 'Server error sending email.' }); }
 });
 
-// --- LIGHTWEIGHT AI INTERVIEW TOPICS (STRICTLY DYNAMIC) ---
+// --- LIGHTWEIGHT AI INTERVIEW TOPICS ---
 router.get('/generate-prep', auth, async (req, res) => {
     try {
         const studentData = await pool.query(`SELECT skills FROM Students WHERE student_id = $1`, [req.user.id]);
@@ -223,7 +258,10 @@ router.get('/generate-prep', auth, async (req, res) => {
         let aiData;
         try {
             const aiResponse = await groq.chat.completions.create({
-                messages: [{ role: "user", content: prompt }], model: "openai/gpt-oss-20b", temperature: 0.2, max_tokens: 500 
+                messages: [{ role: "user", content: prompt }], 
+                model: "openai/gpt-oss-20b", 
+                temperature: 0.2, 
+                max_tokens: 500 
             });
             let rawText = aiResponse.choices[0].message.content.replace(/```json/gi, '').replace(/Lexical/gi, '').replace(/```/gi, '').trim();
             aiData = JSON.parse(rawText.substring(rawText.indexOf('{'), rawText.lastIndexOf('}') + 1));
