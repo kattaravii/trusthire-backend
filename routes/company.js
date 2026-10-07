@@ -100,13 +100,38 @@ router.post('/jobs', auth, async (req, res) => {
             return res.status(403).json({ error: 'Account Pending. You need an active TrustHire RID to post jobs.' });
         }
 
-        const { title, experience, location, expectedZone, salary, skills } = req.body;
+        const { title, experience, location, expectedZone, salary, skills, companyName } = req.body;
         
         await pool.query(
             `INSERT INTO jobs (title, company_id, experience, location, expected_zone, salary, skills) 
              VALUES ($1, $2, $3, $4, $5, $6, $7)`, 
             [title, companyId, experience, location, expectedZone, salary, skills]
         );
+
+        // --- NEW FEATURE: Send Bulk Email Notifications to Students ---
+        try {
+            // Fetch all registered student emails
+            const students = await pool.query("SELECT email FROM Users WHERE role = 'student'");
+            
+            // Format the email variables
+            const senderName = companyName || 'A Partner Company';
+            const jobTitle = title || 'a new position';
+            const subject = `New Job Alert: ${jobTitle} at ${senderName}`;
+            const message = `Hello,\n\nA new job opportunity (${jobTitle}) has just been posted by ${senderName} on TrustHire AI.\n\nLog in to your TrustHire Student Dashboard to review the requirements and apply immediately!\n\nBest,\nThe TrustHire AI Team`;
+
+            // Create an array of email sending tasks
+            const emailPromises = students.rows.map(student => {
+                return sendEmail(student.email, subject, message);
+            });
+
+            // Process all emails in the background silently
+            Promise.allSettled(emailPromises).then(results => {
+                console.log(`Successfully processed ${results.length} job notification emails.`);
+            });
+        } catch (notificationError) {
+            console.error("Failed to send background job notifications:", notificationError);
+        }
+        // --------------------------------------------------------------
 
         res.json({ message: 'Job posted successfully!' });
     } catch (err) {
